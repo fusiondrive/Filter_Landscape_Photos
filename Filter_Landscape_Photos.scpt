@@ -1,81 +1,105 @@
-tell application "Photos"
-    -- ================= 配置 =================
-    set sourceAlbumName to "𝕏"
-    set targetAlbumName to "橫向照片篩選"
-    -- =======================================
-    
-    -- 1. 获取/创建目标相册
-    if not (exists album named targetAlbumName) then
-        make new album named targetAlbumName
-    end if
-    set targetAlbum to album targetAlbumName
-    
-    -- 2. 确定“时间锚点” (High Watermark)
-    -- 【修复1：去本地化】使用对象属性构建日期，彻底解决 "1970年..." 报错
-    set lastCheckDate to (current date)
-    set year of lastCheckDate to 1970
-    set month of lastCheckDate to January
-    set day of lastCheckDate to 1
-    set time of lastCheckDate to 0 -- 00:00:00
-    
-    -- 尝试读取目标相册最后一张照片的时间
-    if (count of media items of targetAlbum) > 0 then
-        try
-            set lastPhoto to last media item of targetAlbum
-            -- 这里的 date 是属性，通常不需要转义，但为了保险
-            set lastCheckDate to date of lastPhoto
-        on error
-            -- 读取失败则维持 1970 默认值
-        end try
-    end if
-    
-    -- 3. 获取所有来源相册
-    set sourceAlbumsList to every album whose name is sourceAlbumName
-    
-    set totalAdded to 0
-    set batchSize to 100
-    set landscapeList to {}
-    
-    repeat with currentAlbum in sourceAlbumsList
-        -- 【修复2：关键字冲突】
-        -- 使用 |date| (管道符) 包裹，强制指代“属性”，解决 -1700 错误
-        -- 这里的逻辑是：从数据库只拉取比锚点时间更新的照片
-        try
-            set candidatePhotos to (every media item of currentAlbum whose |date| > lastCheckDate)
-        on error
-            -- 备用方案：如果 |date| 依然报错，尝试使用 explicit 引用
-            set candidatePhotos to (every media item of currentAlbum whose date of it > lastCheckDate)
-        end try
-        
-        repeat with aPhoto in candidatePhotos
-            try
-                -- 检查长宽比
-                if (width of aPhoto) > (height of aPhoto) then
-                    copy aPhoto to end of landscapeList
-                end if
-            end try
-            
-            -- 批处理写入
-            if (count of landscapeList) is greater than or equal to batchSize then
-                add landscapeList to targetAlbum
-                set landscapeList to {}
-                set totalAdded to totalAdded + batchSize
-            end if
-        end repeat
-    end repeat
-    
-    -- 处理剩余队列
-    if (count of landscapeList) > 0 then
-        add landscapeList to targetAlbum
-        set totalAdded to totalAdded + (count of landscapeList)
-    end if
-    
-    -- 4. 结果反馈
-    beep
-    if totalAdded > 0 then
-        display notification "增量更新完成，添加了 " & totalAdded & " 张照片" with title "照片整理"
-    else
-        display notification "没有发现晚于 " & (short date string of lastCheckDate) & " 的新照片" with title "无需更新"
-    end if
-    
-end tell
+with timeout of 7200 seconds
+	tell application "Photos"
+		-- ================= 配置 =================
+		set sourceAlbumName to "𝕏"
+		set targetAlbumName to "橫向照片篩選"
+		set writeBatchSize to 20
+		-- =======================================
+		
+		-- 1. 准备目标相册
+		set targetAlbumList to every album whose name is targetAlbumName
+		if targetAlbumList is {} then
+			make new album named targetAlbumName
+			set targetAlbumList to every album whose name is targetAlbumName
+		end if
+		set targetAlbum to item 1 of targetAlbumList
+		
+		-- 2. 读取上次扫描时间戳
+		set baseDate to (current date)
+		set year of baseDate to 1970
+		set month of baseDate to January
+		set day of baseDate to 1
+		set time of baseDate to 0
+		
+		set lastCheckDate to baseDate
+		try
+			set savedEpoch to do shell script "cat ~/.photos_landscape_last_scan"
+			set lastCheckDate to baseDate + (savedEpoch as integer)
+		end try
+		
+		set currentRunDate to (current date)
+		
+		-- 3. 获取来源相册并计算总数
+		set sourceAlbumsList to every album whose name is sourceAlbumName
+		if sourceAlbumsList is {} then
+			display dialog "找不到来源相册: " & sourceAlbumName buttons {"确定"}
+			return
+		end if
+		
+		set currentAlbum to item 1 of sourceAlbumsList
+		set totalCount to count of media items of currentAlbum
+		if totalCount is 0 then
+			display notification "来源相册为空，无需扫描。" with title "无需更新"
+			return
+		end if
+		
+		set totalAdded to 0
+		set bufferList to {}
+		set processCount to 0
+		
+		display notification "总计 " & totalCount & " 张。启用 O(1) 单指针内存安全模式..." with title "开始扫描"
+		
+		-- 4. 倒序单指针遍历，避免构造大批量对象说明符
+		repeat with i from totalCount to 1 by -1
+			try
+				set targetPhoto to media item i of currentAlbum
+				
+				if (date of targetPhoto) > lastCheckDate then
+					if (width of targetPhoto) > (height of targetPhoto) then
+						copy targetPhoto to end of bufferList
+					end if
+					
+					set processCount to processCount + 1
+				else
+					exit repeat
+				end if
+				
+				set targetPhoto to missing value
+			on error
+				-- 忽略单张坏图，继续扫描后续项目
+			end try
+			
+			if (count of bufferList) is greater than or equal to writeBatchSize then
+				try
+					add bufferList to targetAlbum
+					set totalAdded to totalAdded + (count of bufferList)
+					set bufferList to {}
+				end try
+			end if
+			
+			if (processCount is not 0) and ((processCount mod 500) is 0) then
+				display notification "已安全检查 " & processCount & " 张新照片..." with title "运行中"
+			end if
+		end repeat
+		
+		if (count of bufferList) > 0 then
+			try
+				add bufferList to targetAlbum
+				set totalAdded to totalAdded + (count of bufferList)
+				set bufferList to {}
+			end try
+		end if
+		
+		-- 5. 仅在成功跑完整个流程后更新时间戳
+		set currentEpoch to currentRunDate - baseDate
+		do shell script "echo " & currentEpoch & " > ~/.photos_landscape_last_scan"
+		
+		-- 6. 结果反馈
+		beep
+		if totalAdded > 0 then
+			display dialog "增量整理完成！" & return & "共检查新照片：" & processCount & " 张" & return & "新增横图：" & totalAdded & " 张" buttons {"确定"}
+		else
+			display notification "本次检查了 " & processCount & " 张，没有发现新横图。" with title "无需更新"
+		end if
+	end tell
+end timeout

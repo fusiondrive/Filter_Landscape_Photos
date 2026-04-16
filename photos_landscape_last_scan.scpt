@@ -1,89 +1,105 @@
-tell application "Photos"
-	-- ================= 配置 =================
-	set sourceAlbumName to "𝕏"
-	set targetAlbumName to "橫向照片篩選"
-	-- =======================================
-	
-	-- 1. 获取/创建目标相册
-	if not (exists album named targetAlbumName) then
-		make new album named targetAlbumName
-	end if
-	set targetAlbum to album targetAlbumName
-	
-	-- 2. 确定“时间锚点” (独立文件记录方案)
-	-- 构建绝对安全的 1970 年基准时间 (Locale-safe)
-	set baseDate to (current date)
-	set year of baseDate to 1970
-	set month of baseDate to January
-	set day of baseDate to 1
-	set time of baseDate to 0
-	
-	-- 尝试从隐藏文件中读取上次扫描的 Unix 时间戳 (纯秒数)
-	set lastCheckDate to baseDate
-	try
-		-- 通过 shell 读取文件内容
-		set savedEpoch to do shell script "cat ~/.photos_landscape_last_scan"
-		-- 将秒数加回基准时间，还原为 AppleScript 的 Date 对象
-		set lastCheckDate to baseDate + (savedEpoch as integer)
-	on error
-		-- 如果文件不存在（通常是第一次运行），则维持 1970 年默认值，全量扫描
-	end try
-	
-	-- 记录本次脚本启动的精确时间，用于任务结束后写入
-	set currentRunDate to (current date)
-	
-	-- 3. 获取所有来源相册
-	set sourceAlbumsList to every album whose name is sourceAlbumName
-	
-	set totalAdded to 0
-	set batchSize to 100
-	set landscapeList to {}
-	
-	repeat with currentAlbum in sourceAlbumsList
-		-- 使用 |date| 拉取比上次运行时间更新的照片
+with timeout of 7200 seconds
+	tell application "Photos"
+		-- ================= 配置 =================
+		set sourceAlbumName to "𝕏"
+		set targetAlbumName to "橫向照片篩選"
+		set writeBatchSize to 20
+		-- =======================================
+		
+		-- 1. 准备目标相册
+		set targetAlbumList to every album whose name is targetAlbumName
+		if targetAlbumList is {} then
+			make new album named targetAlbumName
+			set targetAlbumList to every album whose name is targetAlbumName
+		end if
+		set targetAlbum to item 1 of targetAlbumList
+		
+		-- 2. 读取上次扫描时间戳
+		set baseDate to (current date)
+		set year of baseDate to 1970
+		set month of baseDate to January
+		set day of baseDate to 1
+		set time of baseDate to 0
+		
+		set lastCheckDate to baseDate
 		try
-			set candidatePhotos to (every media item of currentAlbum whose |date| > lastCheckDate)
-		on error
-			set candidatePhotos to (every media item of currentAlbum whose date of it > lastCheckDate)
+			set savedEpoch to do shell script "cat ~/.photos_landscape_last_scan"
+			set lastCheckDate to baseDate + (savedEpoch as integer)
 		end try
 		
-		repeat with aPhoto in candidatePhotos
+		set currentRunDate to (current date)
+		
+		-- 3. 获取来源相册并计算总数
+		set sourceAlbumsList to every album whose name is sourceAlbumName
+		if sourceAlbumsList is {} then
+			display dialog "找不到来源相册: " & sourceAlbumName buttons {"确定"}
+			return
+		end if
+		
+		set currentAlbum to item 1 of sourceAlbumsList
+		set totalCount to count of media items of currentAlbum
+		if totalCount is 0 then
+			display notification "来源相册为空，无需扫描。" with title "无需更新"
+			return
+		end if
+		
+		set totalAdded to 0
+		set bufferList to {}
+		set processCount to 0
+		
+		display notification "总计 " & totalCount & " 张。启用 O(1) 单指针内存安全模式..." with title "开始扫描"
+		
+		-- 4. 倒序单指针遍历，避免构造大批量对象说明符
+		repeat with i from totalCount to 1 by -1
 			try
-				-- 检查长宽比
-				if (width of aPhoto) > (height of aPhoto) then
-					copy aPhoto to end of landscapeList
+				set targetPhoto to media item i of currentAlbum
+				
+				if (date of targetPhoto) > lastCheckDate then
+					if (width of targetPhoto) > (height of targetPhoto) then
+						copy targetPhoto to end of bufferList
+					end if
+					
+					set processCount to processCount + 1
+				else
+					exit repeat
 				end if
+				
+				set targetPhoto to missing value
+			on error
+				-- 忽略单张坏图，继续扫描后续项目
 			end try
 			
-			-- 批处理写入
-			if (count of landscapeList) is greater than or equal to batchSize then
-				add landscapeList to targetAlbum
-				set landscapeList to {}
-				set totalAdded to totalAdded + batchSize
+			if (count of bufferList) is greater than or equal to writeBatchSize then
+				try
+					add bufferList to targetAlbum
+					set totalAdded to totalAdded + (count of bufferList)
+					set bufferList to {}
+				end try
+			end if
+			
+			if (processCount is not 0) and ((processCount mod 500) is 0) then
+				display notification "已安全检查 " & processCount & " 张新照片..." with title "运行中"
 			end if
 		end repeat
-	end repeat
-	
-	-- 处理剩余队列
-	if (count of landscapeList) > 0 then
-		add landscapeList to targetAlbum
-		set totalAdded to totalAdded + (count of landscapeList)
-	end if
-	
-	-- 4. 【核心新增】任务完成后，更新时间戳
-	-- 计算本次运行时间距离 1970 年的秒数
-	set currentEpoch to currentRunDate - baseDate
-	-- 写入系统用户目录下的隐藏文件
-	do shell script "echo " & currentEpoch & " > ~/.photos_landscape_last_scan"
-	
-	-- 5. 结果反馈
-	beep
-	if totalAdded > 0 then
-		display notification "增量更新完成，添加了 " & totalAdded & " 张照片" with title "照片整理"
-	else
-		-- 格式化输出上次扫描时间以便确认
-		set dateString to (short date string of lastCheckDate) & " " & (time string of lastCheckDate)
-		display notification "没有发现晚于 " & dateString & " 的新照片" with title "无需更新"
-	end if
-	
-end tell
+		
+		if (count of bufferList) > 0 then
+			try
+				add bufferList to targetAlbum
+				set totalAdded to totalAdded + (count of bufferList)
+				set bufferList to {}
+			end try
+		end if
+		
+		-- 5. 仅在成功跑完整个流程后更新时间戳
+		set currentEpoch to currentRunDate - baseDate
+		do shell script "echo " & currentEpoch & " > ~/.photos_landscape_last_scan"
+		
+		-- 6. 结果反馈
+		beep
+		if totalAdded > 0 then
+			display dialog "增量整理完成！" & return & "共检查新照片：" & processCount & " 张" & return & "新增横图：" & totalAdded & " 张" buttons {"确定"}
+		else
+			display notification "本次检查了 " & processCount & " 张，没有发现新横图。" with title "无需更新"
+		end if
+	end tell
+end timeout
