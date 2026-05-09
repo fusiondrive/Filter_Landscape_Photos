@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -102,6 +104,46 @@ def dialog(message: str, title: str = "Photos 增量扫描") -> None:
     safe_title = escape_applescript_string(title)
     safe_message = escape_applescript_string(message)
     ui_script(f'display dialog "{safe_message}" with title "{safe_title}" buttons {{"确定"}}')
+
+
+CONTINUE_BUTTON_LABEL = "继续处理下一批 500 张"
+OK_BUTTON_LABEL = "确定"
+
+
+def dialog_with_continue(message: str, title: str = "Photos 增量扫描") -> bool:
+    """显示带 “继续处理下一批” 按钮的弹窗，返回 True 表示用户点了继续。"""
+    safe_title = escape_applescript_string(title)
+    safe_message = escape_applescript_string(message)
+    safe_continue = escape_applescript_string(CONTINUE_BUTTON_LABEL)
+    safe_ok = escape_applescript_string(OK_BUTTON_LABEL)
+    script = (
+        f'display dialog "{safe_message}" with title "{safe_title}" '
+        f'buttons {{"{safe_ok}", "{safe_continue}"}} '
+        f'default button "{safe_continue}" cancel button "{safe_ok}"'
+    )
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    output = (result.stdout or "") + (result.stderr or "")
+    return CONTINUE_BUTTON_LABEL in output
+
+
+def relaunch_script() -> None:
+    """在新进程中重新启动本脚本，让其从已保存的续跑进度继续。"""
+    script_path = os.path.abspath(__file__)
+    try:
+        subprocess.Popen(
+            [sys.executable, script_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        notify("无法重新启动", f"自动续跑失败：{exc}")
 
 
 def beep() -> None:
@@ -468,7 +510,7 @@ def main() -> int:
 
     if hit_per_run_limit:
         save_checkpoint(source_count, max(1, next_resume_index))
-        dialog(
+        should_continue = dialog_with_continue(
             "本轮已安全处理到上限，已保存续跑进度。"
             f"\n\n來源相簿總數：{source_count} 張"
             f"\n本輪檢查新照片：{process_count} 張"
@@ -476,8 +518,12 @@ def main() -> int:
             f"\n本輪單次上限：{MAX_ITEMS_PER_RUN} 張"
             f"\n完成掃描時間戳：本輪未更新"
             f"\n當前仍為：{format_epoch_for_dialog(last_scan_epoch)}"
-            "\n再次執行此腳本會從中斷位置繼續。",
+            f"\n\n点击「{CONTINUE_BUTTON_LABEL}」可立即重新运行脚本，"
+            "从中断位置继续处理下一批 500 张。",
         )
+        if should_continue:
+            notify("继续下一批", "正在重新启动脚本以处理下一批 500 张照片…")
+            relaunch_script()
         return 0
 
     clear_resume_state()
